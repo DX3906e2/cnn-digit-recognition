@@ -44,6 +44,27 @@ import matplotlib  # noqa: E402
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
+_LIB_GRID = 6               # 图片库缩略图网格 6×6 = 36 张
+_MNIST_TEST = None          # 懒加载缓存：(X_test, y_test)
+
+
+def mnist_test_set():
+    """懒加载 MNIST 测试集（只读，不修改 data/ 下任何文件）。"""
+    global _MNIST_TEST
+    if _MNIST_TEST is None:
+        _, _, X, y = data.load_mnist(log=lambda *a: None)
+        _MNIST_TEST = (X, y)
+    return _MNIST_TEST
+
+
+def mnist_gray_to_rgb(g28):
+    """(28,28) float 0~1 → (28,28,3) uint8 RGB。
+
+    量化到 8bit 后走与"存 PNG 再选文件"完全相同的表示，便于两条入口逐位对齐。
+    """
+    u8 = np.clip(np.round(np.asarray(g28, dtype=np.float64) * 255.0), 0, 255).astype(np.uint8)
+    return np.stack([u8, u8, u8], axis=-1)
+
 
 # --------------------------------------------------------------------------- #
 # 图片读取（Tkinter PhotoImage，无 PIL）
@@ -393,6 +414,9 @@ class App:
                   command=self.choose).pack(pady=2)
         tk.Button(left, text="从剪贴板粘贴 (Ctrl+V)", width=26,
                   command=self.paste).pack(pady=2)
+        tk.Button(left, text="从数据集选择…", width=26,
+                  command=self.open_library).pack(pady=2)
+        self._lib = None
         root.bind("<Control-v>", self.paste)
         root.bind("<Control-V>", self.paste)
         tk.Checkbutton(left, text=f"加噪 (sigma={config.NOISE_SIGMA})",
@@ -477,7 +501,7 @@ class App:
         return "break"
 
     def _load_rgb(self, rgb, source):
-        """统一入口：文件路径与剪贴板两条路径都走这里（同一条 to_mnist_format 管线）。"""
+        """统一入口：文件 / 剪贴板 / 数据集三条路径都走这里（同一条 to_mnist_format 管线）。"""
         self.rgb = rgb
         self.gray = data.to_mnist_format(rgb)      # 复用既有管线，不另写灰度/缩放
         self.path = source
@@ -485,6 +509,19 @@ class App:
         self._reset_cache()
         self.lbl_status.config(text=f"已从 {source} 读取，并回到 ① 收到图片")
         self.go(0)
+
+    def open_library(self):
+        """打开 MNIST 图片库窗口（只挑图，不做任何预处理/预测）。"""
+        if self._lib is not None and self._lib.winfo_exists():
+            self._lib.lift()
+            return
+        self._lib = LibraryWindow(self)
+
+    def load_from_dataset(self, idx, label):
+        """图片库回调：把选中的 MNIST 图交给统一入口（不单开捷径）。"""
+        X, _ = mnist_test_set()
+        rgb = mnist_gray_to_rgb(X[idx])
+        self._load_rgb(rgb, f"MNIST test #{idx} (label {label})")
 
     # ---- 分步推进（step N 的计算只在此刻发生）----
     def _compute(self, step):
@@ -576,16 +613,104 @@ class App:
 
 
 # --------------------------------------------------------------------------- #
+# MNIST 图片库窗口（只挑图；处理全交给主窗口五步管线）
+# --------------------------------------------------------------------------- #
+class LibraryWindow:
+    """按标签检索 MNIST 测试集，6×6 缩略图网格，点选后回主窗口走五步。
+
+    本窗口**不加噪、不去噪、不预测**（红线 5），只调用 app.load_from_dataset()。
+    """
+
+    def __init__(self, app):
+        import tkinter as tk
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        self.app = app
+        self.tk = tk
+        self.X, self.y = mnist_test_set()
+        self.label = None                     # None = 全部
+        self.cells = {}                       # ax -> 测试集索引
+        self.top = tk.Toplevel(app.root)
+        self.top.title("MNIST 图片库（点缩略图载入）")
+
+        bar = tk.Frame(self.top)
+        bar.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+        tk.Label(bar, text="标签:", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+        tk.Button(bar, text="全部", width=4, command=lambda: self.set_label(None)).pack(side=tk.LEFT, padx=1)
+        for d in range(config.NUM_CLASSES):
+            tk.Button(bar, text=str(d), width=3,
+                      command=lambda d=d: self.set_label(d)).pack(side=tk.LEFT, padx=1)
+        tk.Button(bar, text="换一批", width=6, command=self.refresh).pack(side=tk.LEFT, padx=8)
+        self.lbl = tk.Label(bar, text="", font=("Microsoft YaHei", 9))
+        self.lbl.pack(side=tk.LEFT, padx=8)
+
+        self.fig = Figure(figsize=(7.5, 7.5), dpi=100, layout="constrained")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.top)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self.on_click)
+
+        self.refresh()
+
+    def set_label(self, d):
+        self.label = d
+        self.refresh()
+
+    def _pool(self):
+        if self.label is None:
+            return np.arange(len(self.y))
+        return np.where(self.y == self.label)[0]
+
+    def refresh(self):
+        pool = self._pool()
+        k = min(_LIB_GRID * _LIB_GRID, len(pool))
+        rng = np.random.default_rng()                 # 「换一批」每次不同
+        pick = rng.choice(pool, size=k, replace=False)
+        self.fig.clear()
+        self.cells = {}
+        axes = self.fig.subplots(_LIB_GRID, _LIB_GRID)
+        for c in range(_LIB_GRID * _LIB_GRID):
+            ax = axes[c // _LIB_GRID, c % _LIB_GRID]
+            ax.set_xticks([]); ax.set_yticks([])
+            if c < k:
+                idx = int(pick[c])
+                ax.imshow(self.X[idx], cmap="gray", vmin=0.0, vmax=1.0)
+                ax.set_title(f"#{idx}\nL{int(self.y[idx])}", fontsize=5)
+                self.cells[ax] = idx
+            else:
+                ax.axis("off")
+        tag = "全部" if self.label is None else f"标签 {self.label}"
+        self.lbl.config(text=f"{tag}：候选 {len(pool)} 张，显示 {k} 张（点缩略图载入）")
+        self.canvas.draw()
+
+    def on_click(self, event):
+        if event.inaxes is None:
+            return
+        idx = self.cells.get(event.inaxes)
+        if idx is None:
+            return
+        label = int(self.y[idx])
+        self.top.destroy()
+        self.app._lib = None
+        self.app.load_from_dataset(idx, label)
+
+
+# --------------------------------------------------------------------------- #
 # 分步自检（无窗口；导出 5 张面板图 + 打印每步数值与耗时）
 # --------------------------------------------------------------------------- #
-def selftest(path, use_noise, prefix):
+def selftest(path=None, use_noise=True, prefix=None, dataset=None, label=None):
     """分步自检：严格按 step0→4 逐步计算并出图，打印每步数值与**该步真实耗时**。
 
     每步的计算发生在该步内，不在开头一次性算完（便于验证"分步是真的"）。
+    两种图源（都走同一条 to_mnist_format 管线）：
+      - path   : 本地图片路径
+      - dataset: MNIST 测试集第 dataset 张（若给 label，则表示"标签 label 下的第 dataset 张"）
     """
     matplotlib.use("Agg")
     from matplotlib.figure import Figure
 
+    if prefix is None:
+        prefix = os.path.join(config.OUTPUT_DIR, "app_selftest")
     cnn = CNN()
     load_model(cnn, config.MODEL_PATH)
     kernel = filters.gaussian_kernel()
@@ -600,14 +725,32 @@ def selftest(path, use_noise, prefix):
         info = drawfn(fig, *a, **kw)
         return info, (time.perf_counter() - t) * 1000.0, fig
 
-    # step0：载入 + 灰度化
+    # step0：载入 + 灰度化（两种图源二选一）
+    true_label = None
     t0 = time.perf_counter()
-    rgb = photoimage_to_rgb(path)
+    if path is not None:
+        rgb = photoimage_to_rgb(path)
+        source = path
+    else:
+        X, y = mnist_test_set()
+        n = 0 if dataset is None else int(dataset)
+        if label is None:
+            idx = int(n)
+        else:
+            hits = np.where(y == int(label))[0]
+            if len(hits) == 0:
+                raise ValueError(f"测试集中没有标签 {label}")
+            idx = int(hits[n % len(hits)])
+        true_label = int(y[idx])
+        rgb = mnist_gray_to_rgb(X[idx])
+        source = f"MNIST test #{idx} (label {true_label})"
     gray = data.to_mnist_format(rgb)
     ms0 = (time.perf_counter() - t0) * 1000.0
     i0, _, fig = run((9, 4.5), draw_step0, rgb, gray)
     fig.savefig(prefix + "_step0.png", dpi=110)
-    print(f"[selftest] image      : {path}")
+    print(f"[selftest] source     : {source}")
+    if true_label is not None:
+        print(f"[selftest] true label : {true_label}")
     print(f"[selftest] step0 ①     : raw{tuple(i0['raw_shape'])} raw_gray_mean={i0['raw_gray_mean']:.4f} "
           f"auto_inverted={i0['auto_inverted']} gray_mean={i0['gray_mean']:.4f}   ({ms0:.2f} ms)")
 
@@ -650,7 +793,8 @@ def selftest(path, use_noise, prefix):
     ms4 = (time.perf_counter() - t4) * 1000.0
     i4, _, fig = run((11, 4.5), draw_step4, gray, probs, pred, conf)
     fig.savefig(prefix + "_step4.png", dpi=110)
-    print(f"[selftest] step4 ⑤     : pred={pred} conf={conf:.6f}   ({ms4:.2f} ms)")
+    extra = "" if true_label is None else f"   true={true_label}   一致={pred == true_label}"
+    print(f"[selftest] step4 ⑤     : pred={pred} conf={conf:.6f}{extra}   ({ms4:.2f} ms)")
     print(f"[selftest] probs       : {[round(float(p), 4) for p in probs]}")
     print(f"[selftest] panels      : {prefix}_step0.png ... _step4.png")
     return {"pred": pred, "conf": conf, "probs": probs, "acts": acts, "gray": gray,
@@ -660,7 +804,10 @@ def selftest(path, use_noise, prefix):
 def main():
     ap = argparse.ArgumentParser(description="MNIST 五步可视化窗口（Phase 6.1 Part A）")
     ap.add_argument("--model", type=str, default=None)
-    ap.add_argument("--selftest", type=str, default=None, help="无窗口自检：图片路径")
+    ap.add_argument("--selftest", type=str, default=None, help="无窗口自检：本地图片路径")
+    ap.add_argument("--dataset", type=int, default=None,
+                    help="无窗口自检：改用 MNIST 测试集第 N 张（与 --label 联用表示该标签下第 N 张）")
+    ap.add_argument("--label", type=int, default=None, help="配合 --dataset：限定真实标签 0~9")
     ap.add_argument("--no-noise", action="store_true", help="自检时关闭加噪")
     ap.add_argument("--out-prefix", type=str,
                     default=os.path.join(config.OUTPUT_DIR, "app_selftest"),
@@ -670,11 +817,12 @@ def main():
     if args.model:
         config.MODEL_PATH = args.model
 
-    if args.selftest:
+    if args.selftest or args.dataset is not None:
         prefix = args.out_prefix
         if args.out:
             prefix = args.out[:-4] if args.out.lower().endswith(".png") else args.out
-        selftest(args.selftest, not args.no_noise, prefix)
+        selftest(path=args.selftest, use_noise=not args.no_noise, prefix=prefix,
+                 dataset=args.dataset, label=args.label)
         return
 
     import tkinter as tk

@@ -45,6 +45,14 @@ _FILES = {
 _IMG_MAGIC = 2051   # 0x00000803
 _LBL_MAGIC = 2049   # 0x00000801
 
+# ---- to_mnist_format 预处理参数（Phase 8）----
+_FG_THRESHOLD = 0.15        # 前景判定阈值（反色后数字为亮）
+_CROP_MARGIN = 4            # 裁剪居中后四周留白像素
+_CROP_SKIP_RATIO = 0.85     # bbox 覆盖画面 >= 此比例 -> 已占满，跳过裁剪
+_OTSU_BINS = 256            # Otsu 直方图箱数
+_OTSU_WARN_HI = 0.9         # 阈值极端上界（超过则警告）
+_OTSU_WARN_LO = 0.1         # 阈值极端下界（低于则警告）
+
 
 def _resolve_dir(path):
     """相对路径以仓库根解析；返回绝对路径目录。"""
@@ -167,12 +175,113 @@ def add_gaussian_noise(X, sigma=None, rng=None):
     return np.clip(X + sigma * rng.standard_normal(X.shape), 0.0, 1.0).astype(np.float64)
 
 
+def _otsu_threshold(a):
+    """Otsu 阈值：遍历 256 个候选，最大化组间方差 w0*w1*(m0-m1)^2（纯 NumPy）。
+
+    返回 (阈值, 是否可用)。直方图退化（全图同值 / 无有效分割）时 是否可用=False。
+    """
+    hist, edges = np.histogram(a, bins=_OTSU_BINS, range=(0.0, 1.0))
+    total = a.size
+    if total == 0:
+        return 0.0, False
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    w0 = np.cumsum(hist).astype(np.float64)          # 背景像素数(累计)
+    w1 = total - w0                                  # 前景像素数
+    csum = np.cumsum(hist * centers)
+    good = (w0 > 0) & (w1 > 0)
+    if not np.any(good):
+        return 0.0, False
+    m0 = np.zeros_like(w0)
+    m1 = np.zeros_like(w0)
+    m0[good] = csum[good] / w0[good]
+    m1[good] = (csum[-1] - csum[good]) / w1[good]
+    between = np.where(good, w0 * w1 * (m0 - m1) ** 2, -1.0)
+    if between.max() <= 0.0:
+        return 0.0, False
+    return float(centers[int(np.argmax(between))]), True
+
+
+def _binarize_otsu(a):
+    """A1: Otsu 二值化 -> 输出只含 0.0 / 1.0。退化输入原样返回（不崩）。
+
+    - 直方图退化（近纯色、无有效分割）-> 跳过二值化
+    - 二值化后前景占比为 0（或全前景）-> 跳过二值化
+    - 阈值极端（>0.9 或 <0.1）-> 仍执行，但打印一条警告
+    """
+    t, ok = _otsu_threshold(a)
+    if not ok:
+        return a
+    if t > _OTSU_WARN_HI or t < _OTSU_WARN_LO:
+        print(f"[to_mnist_format] 警告: Otsu 阈值极端 t={t:.3f}（图像对比度过低?）")
+    out = (a > t).astype(np.float64)
+    fg = float(out.mean())
+    if fg <= 0.0 or fg >= 1.0:
+        return a
+    return out
+
+
+def _bbox(mask):
+    """由前景掩码求 bounding box，返回 (r0, r1, c0, c1)（半开区间）或 None。"""
+    if not mask.any():
+        return None
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+
+
+def _crop_and_center(a):
+    """A2: 前景裁剪 + 保持长宽比缩放 + 居中到 28×28（纯 NumPy，盒式平均）。
+
+    自适应规则（避免损伤本来就标准的输入）：
+      1. 输入已经是 28×28（如标准 MNIST，数据集本身已做 20×20 居中归整）
+         -> 跳过裁剪，避免二次归整破坏笔画几何
+      2. 前景为空（纯色图）-> 跳过
+      3. 用固定阈值 _FG_THRESHOLD 求 bbox；若 bbox 已覆盖画面 >= skip_ratio
+         （典型原因：拍照/截图有明显光照梯度，背景也超过阈值）
+         -> 改用 Otsu 阈值再求一次 bbox；仍覆盖过大则跳过裁剪
+      4. 缩放一律用盒式平均（_resize_box），不用最近邻
+    """
+    canvas = config.IMG_SIZE
+    if a.shape == (canvas, canvas):
+        return a
+    target = canvas - 2 * _CROP_MARGIN
+
+    box = _bbox(a > _FG_THRESHOLD)
+    if box is None:
+        return a
+    r0, r1, c0, c1 = box
+    if (r1 - r0) * (c1 - c0) >= _CROP_SKIP_RATIO * a.size:
+        t, ok = _otsu_threshold(a)
+        box2 = _bbox(a > t) if ok else None
+        if box2 is None:
+            return a
+        r0, r1, c0, c1 = box2
+        if (r1 - r0) * (c1 - c0) >= _CROP_SKIP_RATIO * a.size:
+            return a
+
+    crop = a[r0:r1, c0:c1]
+    h, w = crop.shape
+    scale = target / max(h, w)
+    nh = max(1, int(round(h * scale)))
+    nw = max(1, int(round(w * scale)))
+    small = _resize_box(crop, nh, nw)
+    out = np.zeros((canvas, canvas), dtype=np.float64)
+    top = (canvas - nh) // 2
+    left = (canvas - nw) // 2
+    out[top:top + nh, left:left + nw] = small
+    return out
+
+
 def to_mnist_format(img):
     """把任意 numpy 数组规整为 MNIST 风格单通道 (28, 28) float64 0~1。
 
     不负责文件 IO（文件读取留给 Phase 6 的 Tkinter）。
-    处理步骤：①值域>1 则 /255；②RGB→灰度(0.299/0.587/0.114)；③盒式平均缩放 28×28；
-    ④自动反色：均值>0.5 认为白底黑字，取 1-img（MNIST 为黑底白字）。
+    处理步骤（Phase 8 改进后的顺序）：
+      ①值域>1 则 /255；②RGB→灰度(0.299/0.587/0.114)；
+      ③自动反色：均值>0.5 认为白底黑字，取 1-img（MNIST 为黑底白字）；
+      ④前景裁剪 + 居中（自适应，已占满则跳过）；⑤盒式平均缩放 28×28；
+      ⑥Otsu 二值化（输出只含 0.0/1.0；退化输入跳过）。
+    返回 (28, 28) float64，签名与返回类型与旧版一致。
     """
     img = np.asarray(img, dtype=np.float64)
     if img.size == 0:
@@ -187,11 +296,15 @@ def to_mnist_format(img):
     if img.ndim != 2:
         raise ValueError(f"无法解释的形状 {img.shape}（需 2D 灰度或 3D RGB）")
 
+    if img.mean() > 0.5:  # 自动反色：白底黑字 -> 黑底白字
+        img = 1.0 - img
+
+    img = _crop_and_center(img)          # A2（自适应；已占满/纯色则跳过）
+
     if img.shape != (config.IMG_SIZE, config.IMG_SIZE):
         img = _resize_box(img, config.IMG_SIZE, config.IMG_SIZE)
 
-    if img.mean() > 0.5:  # 自动反色：白底黑字 -> 黑底白字
-        img = 1.0 - img
+    img = _binarize_otsu(img)            # A1（退化输入跳过）
     return img
 
 
