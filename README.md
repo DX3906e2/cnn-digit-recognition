@@ -1,4 +1,7 @@
-# 手写数字识别（全手写 NumPy 实现）
+# 卷积神经网络数字识别
+
+> 纯 NumPy 从零手写 CNN：输入图片 → 预处理 → 高斯卷积去噪 → 识别数字 0-9。
+> 不使用 torch / tensorflow / sklearn / scipy / cv2 / PIL —— 卷积、反向传播、池化、SGD 全部手写。
 
 ## 1. 项目简介
 
@@ -48,7 +51,10 @@ src/                        9 个扁平模块（无子包）
   viz.py                    绘图工具（曲线/混淆矩阵/去噪对比/对照柱状图）
   app.py                    Tkinter 五步可视化窗口 + MNIST 图片库（含 --selftest 自检）
 data/mnist/                 MNIST 原始数据（4 个 .gz，已提交进版本库）
-outputs/                    训练曲线、混淆矩阵、去噪对比、对照图；model*.npz（不进版本库）
+outputs/                    训练曲线、混淆矩阵、去噪对比、对照图；model*.npz（三个权重已入库作云端留档）
+docs/                       过程文档：项目框架、盘问记录、交接提示词、原理讲解
+启动窗口.bat                 双击启动可视化窗口（pythonw，无控制台）
+LICENSE                     MIT 许可证
 ```
 
 ## 4. 快速开始
@@ -187,8 +193,25 @@ python src/app.py --dataset 127 --label 5 --out-prefix agent/experiments/selftes
 - **未使用**：torch / tensorflow / sklearn / scipy / cv2 / PIL / `np.fft`（依赖仅 numpy + matplotlib）；
 - **边界策略统一**：全部卷积为 zero-pad / same，前向与反向同源（`filters.py`）；
 - **参数集中**：所有可调参数来自 `src/config.py`，不在别处散落魔法数字；
-- **不进版本库**：`agent/`（工作痕迹）、`third_party/`（参考代码）、`*.npz`（权重）、
-  `__pycache__/`、`outputs/log_*.txt`（训练日志）。
+- **不进版本库**：`agent/`（工作痕迹）、`third_party/`（参考代码）、`__pycache__/`、
+  `outputs/log_*.txt`（训练日志）、`outputs/archive/`（本地归档）；
+- **例外（有意入库）**：`outputs/model.npz`、`model_A.npz`、`model_C.npz` 三个权重
+  **已提交进版本库**作云端留档，避免本地被冒烟训练误覆盖后无法追溯。
 
 **数字可复核**：第 6 节的"使用边界"表由 `agent/experiments/measure_boundary.py` 实测生成
 （该脚本位于 `agent/` 下、不进版本库，但随项目保留在本地，可随时重跑复核）。
+
+## 10. 许可证
+
+本项目采用 **MIT License**（可自由使用、修改、分发），详见 [`LICENSE`](LICENSE)。
+
+## 11. 文档
+
+`docs/` 目录存放项目过程文档，与源码分离：
+
+| 文件 | 内容 |
+|---|---|
+| `docs/项目框架.md` | 项目框架、决策表（D1~D15）与验收标准 |
+| `docs/grilling/` | 需求盘问记录（决策树的完整推导过程） |
+| `docs/实现Agent交接提示词.md` | 交给实现方的交接说明 |
+| `docs/原理讲解.docx` | 原理讲解文档（面向读者） |
